@@ -65,6 +65,10 @@ struct NetworkMessage: Codable, Equatable {
   var app: String
   var title: String?
   var url: String?
+  // Local file or directory the window shows: the open document for
+  // document-based apps, the shell's working directory for terminals that
+  // report it (OSC 7).
+  var path: String?
 }
 
 struct Heartbeat: Codable {
@@ -482,7 +486,7 @@ func sendHeartbeatSingle(_ heartbeat: Heartbeat, pulsetime: Double) async throws
     throw HeartbeatError.error(msg: "Failed to send heartbeat: \(response)")
   }
 
-  debug("[heartbeat] bucket: \(bucketName), timestamp: \(heartbeat.timestamp), pulsetime: \(round(pulsetime * 10) / 10), app: \(heartbeat.data.app), title: \(heartbeat.data.title ?? ""), url: \(heartbeat.data.url ?? "")")
+  debug("[heartbeat] bucket: \(bucketName), timestamp: \(heartbeat.timestamp), pulsetime: \(round(pulsetime * 10) / 10), app: \(heartbeat.data.app), title: \(heartbeat.data.title ?? ""), url: \(heartbeat.data.url ?? ""), path: \(heartbeat.data.path ?? "")")
 }
 
 class MainThing {
@@ -552,6 +556,22 @@ class MainThing {
     return nil
   }
 
+  // The window's AXDocument, when it names a local file. Document-based apps
+  // set it to the open file; terminals that map OSC 7 onto the window (Ghostty,
+  // Terminal.app) set it to the shell's working directory. Unlike the title,
+  // programs running in the terminal cannot overwrite it with escape codes.
+  // Re-read on every poll, so a `cd` is picked up without a title change.
+  func documentPath(window: AXUIElement) -> String? {
+    var documentRef: AnyObject?
+    AXUIElementCopyAttributeValue(window, kAXDocumentAttribute as CFString, &documentRef)
+    guard let document = axString(documentRef),
+          let url = URL(string: document),
+          url.isFileURL else {
+      return nil
+    }
+    return url.path
+  }
+
   @objc func pollActiveWindow() {
     debug("Polling active window")
 
@@ -598,7 +618,11 @@ class MainThing {
     AXUIElementCopyAttributeValue(axElement, kAXTitleAttribute as CFString, &windowTitle)
 
     let applicationName = frontmost.localizedName ?? frontmost.bundleIdentifier ?? ""
-    var data = NetworkMessage(app: applicationName, title: axString(windowTitle) ?? "")
+    var data = NetworkMessage(
+      app: applicationName,
+      title: axString(windowTitle) ?? "",
+      path: documentPath(window: axElement)
+    )
 
     if CHROME_BROWSERS.contains(applicationName) {
       debug("Chrome browser detected, extracting URL and title")
@@ -688,9 +712,10 @@ class MainThing {
       data = applyResearchFilter(data)
     } else if excludeTitle || titleShouldBeExcluded(data.title ?? "") {
       data.title = "excluded"
-      // the URL identifies the page at least as precisely as the title does,
-      // so an excluded window must not report it either
+      // the URL and path identify the page or document at least as precisely
+      // as the title does, so an excluded window must not report them either
       data.url = nil
+      data.path = nil
     }
 
     let heartbeat = Heartbeat(timestamp: nowTime, data: data)
